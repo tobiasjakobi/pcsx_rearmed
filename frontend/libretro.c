@@ -28,6 +28,17 @@
 #include "revision.h"
 #include "libretro.h"
 
+struct vout_config {
+	void *buf;
+
+	int width, height;
+	int doffs_old;
+
+	bool fb_dirty;
+	bool can_dupe;
+	bool dupe_enabled;
+};
+
 static retro_video_refresh_t video_cb;
 static retro_input_poll_t input_poll_cb;
 static retro_input_state_t input_state_cb;
@@ -35,11 +46,7 @@ static retro_environment_t environ_cb;
 static retro_audio_sample_batch_t audio_batch_cb;
 static struct retro_rumble_interface rumble;
 
-static void *vout_buf;
-static int vout_width, vout_height;
-static int vout_doffs_old, vout_fb_dirty;
-static bool vout_can_dupe;
-static bool duping_enable;
+struct vout_config v_cfg;
 
 static int plugins_opened;
 static int is_pal_mode;
@@ -98,8 +105,8 @@ static int vout_open(void)
 
 static void vout_set_mode(int w, int h, int raw_w, int raw_h, int bpp)
 {
-	vout_width = w;
-	vout_height = h;
+	v_cfg.width = w;
+	v_cfg.height = h;
 }
 
 #ifndef FRONTEND_SUPPORTS_RGB565
@@ -116,23 +123,23 @@ static void convert(void *buf, size_t bytes)
 
 static void vout_flip(const void *vram, int stride, int bgr24, int w, int h)
 {
-	unsigned short *dest = vout_buf;
+	unsigned short *dest = v_cfg.buf;
 	const unsigned short *src = vram;
-	int dstride = vout_width, h1 = h;
+	int dstride = v_cfg.width, h1 = h;
 	int doffs;
 
 	if (vram == NULL) {
 		// blanking
-		memset(vout_buf, 0, dstride * h * 2);
+		memset(dest, 0, dstride * h * 2);
 		goto out;
 	}
 
-	doffs = (vout_height - h) * dstride;
+	doffs = (v_cfg.height - h) * dstride;
 	doffs += (dstride - w) / 2 & ~1;
-	if (doffs != vout_doffs_old) {
+	if (doffs != v_cfg.doffs_old) {
 		// clear borders
-		memset(vout_buf, 0, dstride * h * 2);
-		vout_doffs_old = doffs;
+		memset(dest, 0, dstride * h * 2);
+		v_cfg.doffs_old = doffs;
 	}
 	dest += doffs;
 
@@ -154,9 +161,9 @@ static void vout_flip(const void *vram, int stride, int bgr24, int w, int h)
 
 out:
 #ifndef FRONTEND_SUPPORTS_RGB565
-	convert(vout_buf, vout_width * vout_height * 2);
+	convert(v_cfg.buf, v_cfg.width * v_cfg.height * 2);
 #endif
-	vout_fb_dirty = 1;
+	v_cfg.fb_dirty = true;
 	pl_rearmed_cbs.flip_cnt++;
 }
 
@@ -1032,9 +1039,9 @@ static void update_variables(bool in_flight)
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) || var.value)
    {
       if (strcmp(var.value, "off") == 0)
-         duping_enable = false;
+         v_cfg.dupe_enabled = false;
       else if (strcmp(var.value, "on") == 0)
-         duping_enable = true;
+         v_cfg.dupe_enabled = true;
    }
 
 #ifndef DRC_DISABLE
@@ -1128,9 +1135,15 @@ void retro_run(void)
 	stop = 0;
 	psxCpu->Execute();
 
-	video_cb((vout_fb_dirty || !vout_can_dupe || !duping_enable) ? vout_buf : NULL,
-		vout_width, vout_height, vout_width * 2);
-	vout_fb_dirty = 0;
+	{
+		void *buf = NULL;
+
+		if (v_cfg.fb_dirty || !v_cfg.can_dupe || !v_cfg.dupe_enabled)
+			buf = v_cfg.buf;
+
+		video_cb(buf, v_cfg.width, v_cfg.height, v_cfg.width * 2);
+		v_cfg.fb_dirty = false;
+	}
 }
 
 static bool try_use_bios(const char *path)
@@ -1209,9 +1222,9 @@ void retro_init(void)
 	}
 
 #if defined(_POSIX_C_SOURCE) && (_POSIX_C_SOURCE >= 200112L)
-	posix_memalign(&vout_buf, 16, VOUT_MAX_WIDTH * VOUT_MAX_HEIGHT * 2);
+	posix_memalign(&v_cfg.buf, 16, VOUT_MAX_WIDTH * VOUT_MAX_HEIGHT * 2);
 #else
-	vout_buf = malloc(VOUT_MAX_WIDTH * VOUT_MAX_HEIGHT * 2);
+	v_cfg.buf = malloc(VOUT_MAX_WIDTH * VOUT_MAX_HEIGHT * 2);
 #endif
 
 	if (environ_cb(RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY, &dir) && dir)
@@ -1242,7 +1255,7 @@ void retro_init(void)
 		environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE, (void*)&msg);
 	}
 
-	environ_cb(RETRO_ENVIRONMENT_GET_CAN_DUPE, &vout_can_dupe);
+	environ_cb(RETRO_ENVIRONMENT_GET_CAN_DUPE, &v_cfg.can_dupe);
 	environ_cb(RETRO_ENVIRONMENT_SET_DISK_CONTROL_INTERFACE, &disk_control);
 	environ_cb(RETRO_ENVIRONMENT_GET_RUMBLE_INTERFACE, &rumble);
 
@@ -1274,6 +1287,6 @@ void retro_init(void)
 void retro_deinit(void)
 {
 	SysClose();
-	free(vout_buf);
-	vout_buf = NULL;
+	free(v_cfg.buf);
+	v_cfg.buf = NULL;
 }
