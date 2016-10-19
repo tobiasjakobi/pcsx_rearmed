@@ -37,6 +37,8 @@ struct vout_config {
 	bool fb_dirty;
 	bool can_dupe;
 	bool dupe_enabled;
+	bool swfb_configured;
+	bool swfb_enabled;
 };
 
 static retro_video_refresh_t video_cb;
@@ -45,6 +47,7 @@ static retro_input_state_t input_state_cb;
 static retro_environment_t environ_cb;
 static retro_audio_sample_batch_t audio_batch_cb;
 static struct retro_rumble_interface rumble;
+static struct retro_framebuffer_config fb_cfg;
 
 struct vout_config v_cfg;
 
@@ -109,6 +112,24 @@ static void vout_set_mode(int w, int h, int raw_w, int raw_h, int bpp)
 	v_cfg.height = h;
 }
 
+static void swfb_set_mode(int w, int h, int raw_w, int raw_h, int bpp)
+{
+	enum retro_pixel_format pf;
+
+	v_cfg.width = w;
+	v_cfg.height = h;
+
+	if (bpp == 16)
+		pf = RETRO_PIXEL_FORMAT_XBGR1555;
+	else
+		pf = RETRO_PIXEL_FORMAT_PACKED_BGR888;
+
+	if (!fb_cfg.set_format(fb_cfg.framebuffer_context, pf, w, h)) {
+		SysPrintf("Failed to set software framebuffer format.\n");
+		exit(1);
+	}
+}
+
 #ifndef FRONTEND_SUPPORTS_RGB565
 static void convert(void *buf, size_t bytes)
 {
@@ -163,6 +184,36 @@ out:
 #ifndef FRONTEND_SUPPORTS_RGB565
 	convert(v_cfg.buf, v_cfg.width * v_cfg.height * 2);
 #endif
+	v_cfg.fb_dirty = true;
+	pl_rearmed_cbs.flip_cnt++;
+}
+
+static void swfb_flip(const void *vram, int stride, int bgr24, int w, int h) {
+	void *buf;
+	size_t buf_stride;
+	unsigned i, rowsize;
+
+	if (!fb_cfg.get_current_addr(fb_cfg.framebuffer_context, &buf, &buf_stride)) {
+		SysPrintf("Failed to get current software framebuffer address.\n");
+		exit(1);
+	}
+
+	if (vram == NULL) {
+		memset(buf, 0, buf_stride * h);
+		goto out;
+	}
+
+	/* The source stride is given in number of 16-bit elements. */
+	stride *= 2;
+	rowsize = w * (bgr24 ? 3 : 2);
+
+	for (i = 0; i < h; ++i) {
+		memcpy(buf, vram, rowsize);
+		buf += buf_stride;
+		vram += stride;
+	}
+
+out:
 	v_cfg.fb_dirty = true;
 	pl_rearmed_cbs.flip_cnt++;
 }
@@ -1105,9 +1156,65 @@ static void update_variables(bool in_flight)
    }
 }
 
+static void config_software_framebuffer(void)
+{
+	unsigned i;
+
+	if (v_cfg.swfb_configured)
+		return;
+
+	fprintf(stderr, "DEBUG: config_software_framebuffer\n");
+
+	fb_cfg.max_width = VOUT_MAX_WIDTH;
+	fb_cfg.max_height = VOUT_MAX_HEIGHT;
+
+	if (environ_cb(RETRO_ENVIRONMENT_CONFIG_SOFTWARE_FRAMEBUFFER, &fb_cfg)) {
+		bool found_xbgr1555 = false;
+		bool found_packed_bgr888 = false;
+
+		/* Check for mandatory pixel formats. */
+		for (i = 0; i < fb_cfg.num_formats; ++i) {
+			enum retro_pixel_format pf = fb_cfg.formats[i];
+
+			if (pf == RETRO_PIXEL_FORMAT_XBGR1555)
+				found_xbgr1555 = true;
+
+			if (pf == RETRO_PIXEL_FORMAT_PACKED_BGR888)
+				found_packed_bgr888 = true;
+		}
+
+		if (!found_xbgr1555 || !found_packed_bgr888) {
+			SysPrintf("Software framebuffer support available, but mandatory pixel formats missing.\n");
+
+			/* Disable software framebuffer support again. */
+			fb_cfg.max_width = 0;
+			fb_cfg.max_height = 0;
+
+			environ_cb(RETRO_ENVIRONMENT_CONFIG_SOFTWARE_FRAMEBUFFER, &fb_cfg);
+		} else {
+			SysPrintf("Using software framebuffer support with formats:\n");
+			SysPrintf("XBGR1555, packed BGR888\n");
+
+			pl_rearmed_cbs.pl_vout_set_mode = swfb_set_mode;
+			pl_rearmed_cbs.pl_vout_flip = swfb_flip;
+
+			v_cfg.swfb_enabled = true;
+		}
+	}
+
+	v_cfg.swfb_configured = true;
+}
+
 void retro_run(void) 
 {
 	int i;
+
+	/*
+	 * We can't configure the software framebuffer in retro_init(), since
+	 * at that point the drivers of the frontend, so in particular the
+	 * video driver, aren't initialised yet.
+	 */
+	config_software_framebuffer();
 
 	input_poll_cb();
 
@@ -1135,6 +1242,26 @@ void retro_run(void)
 	stop = 0;
 	psxCpu->Execute();
 
+	if (v_cfg.swfb_enabled)
+	{
+		const struct retro_rectangle *rect = NULL;
+
+		const struct retro_rectangle r = {
+			.x = 0,
+			.y = 0,
+			.w = v_cfg.width,
+			.h = v_cfg.height
+		};
+
+		if (v_cfg.fb_dirty || !v_cfg.can_dupe || !v_cfg.dupe_enabled)
+			rect = &r;
+
+		if (!fb_cfg.video_refresh(fb_cfg.framebuffer_context, rect)) {
+			SysPrintf("Failed to issue video refresh for software framebuffer.\n");
+			exit(1);
+		}
+	}
+	else
 	{
 		void *buf = NULL;
 
@@ -1142,8 +1269,9 @@ void retro_run(void)
 			buf = v_cfg.buf;
 
 		video_cb(buf, v_cfg.width, v_cfg.height, v_cfg.width * 2);
-		v_cfg.fb_dirty = false;
 	}
+
+	v_cfg.fb_dirty = false;
 }
 
 static bool try_use_bios(const char *path)
